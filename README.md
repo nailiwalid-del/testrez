@@ -12,3 +12,8 @@ chmod 700 /home/netdiag/netsavf_probe.sh
 # 4. Lancer (mot de passe par env, pas en argv)
 POV_FTP_PASSWORD='secret' /QOpenSys/usr/bin/sh /home/netdiag/netsavf_probe.sh \
   -h 10.10.20.30 -u FTPUSER -l MYLIB -s MYSAVF -d /incoming -L NETDIAGLIB
+---------------------------
+
+# Sources dans l'IFS : /home/netdiag/runprobe.cmd et runprobecl.clle
+# 1) Le programme de traitement
+system "CRTBNDCL PGM(NETDIAGLIB/RUNPROBECL) SRCSTMF('/home/netdiag/runprobecl.clle')"
