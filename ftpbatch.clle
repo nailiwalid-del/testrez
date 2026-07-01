@@ -1,0 +1,87 @@
+/* ================================================================= *
+ *  FTPBATCH - Transfert FTP batch natif, atomique (1 niveau appel).  *
+ *                                                                    *
+ *  Objectif : encapsuler OVRDBF(INPUT/OUTPUT) + FTP dans UN seul     *
+ *  programme, pour que les overrides restent valides pendant tout    *
+ *  le FTP (ce qui n'est PAS garanti entre appels 'system' PASE       *
+ *  successifs). Les entrees arrivent par variables d'environnement   *
+ *  posees par le shell (export) et lues ici par RTVENVVAR : cela     *
+ *  evite les pieges de longueur des litteraux *CHAR sur CALL.        *
+ *                                                                    *
+ *  Variables d'env attendues :                                       *
+ *    POV_RMTSYS  = hote/IP distant                                   *
+ *    POV_PORT    = port FTP (numerique, ex '21')                     *
+ *    POV_INSTMF  = chemin IFS du fichier des sous-commandes FTP      *
+ *    POV_OUTSTMF = chemin IFS ou ecrire le log FTP                   *
+ *                                                                    *
+ *  Compilation (V7R2 / V7R3) :                                       *
+ *    CRTBNDCL PGM(NETDIAGLIB/FTPBATCH) +                             *
+ *             SRCSTMF('/home/netdiag/ftpbatch.clle')                 *
+ *  ou via membre source QCLSRC :                                     *
+ *    CRTBNDCL PGM(NETDIAGLIB/FTPBATCH) SRCFILE(NETDIAGLIB/QCLSRC)    *
+ *                                                                    *
+ *  Autorite requise : acces FTP + creation objets en QTEMP.          *
+ * ================================================================= */
+             PGM
+
+             DCL        VAR(&RMTSYS)  TYPE(*CHAR) LEN(255)
+             DCL        VAR(&PORTC)   TYPE(*CHAR) LEN(5)
+             DCL        VAR(&PORTN)   TYPE(*DEC)  LEN(5 0)
+             DCL        VAR(&INSTMF)  TYPE(*CHAR) LEN(500)
+             DCL        VAR(&OUTSTMF) TYPE(*CHAR) LEN(500)
+
+             /* --- Lecture des parametres depuis l'environnement du job --- */
+             RTVENVVAR  VAR(&RMTSYS)  ENVVAR('POV_RMTSYS')
+             RTVENVVAR  VAR(&PORTC)   ENVVAR('POV_PORT')
+             RTVENVVAR  VAR(&INSTMF)  ENVVAR('POV_INSTMF')
+             RTVENVVAR  VAR(&OUTSTMF) ENVVAR('POV_OUTSTMF')
+
+             /* Conversion char -> decimal (tolere les blancs de fin) */
+             CHGVAR     VAR(&PORTN)   VALUE(&PORTC)
+
+             /* --- Table de travail en QTEMP (privee au job) --- */
+             DLTF       FILE(QTEMP/FTPIN)
+             MONMSG     MSGID(CPF0000)
+             DLTF       FILE(QTEMP/FTPOUT)
+             MONMSG     MSGID(CPF0000)
+
+             CRTPF      FILE(QTEMP/FTPIN)  RCDLEN(512) MBR(FTPIN)  +
+                          SIZE(*NOMAX)
+             MONMSG     MSGID(CPF0000)
+             CRTPF      FILE(QTEMP/FTPOUT) RCDLEN(512) MBR(FTPOUT) +
+                          SIZE(*NOMAX)
+             MONMSG     MSGID(CPF0000)
+
+             /* --- Charge les sous-commandes FTP depuis le stream file --- */
+             /* CVTDTA(*AUTO) : conversion ASCII/UTF-8 -> EBCDIC job          */
+             CPYFRMSTMF FROMSTMF(&INSTMF) +
+                          TOMBR('/QSYS.LIB/QTEMP.LIB/FTPIN.FILE/FTPIN.MBR') +
+                          MBROPT(*REPLACE) CVTDTA(*AUTO)
+
+             /* --- Overrides valides pendant toute l'execution du FTP --- */
+             OVRDBF     FILE(INPUT)  TOFILE(QTEMP/FTPIN)  MBR(FTPIN)
+             OVRDBF     FILE(OUTPUT) TOFILE(QTEMP/FTPOUT) MBR(FTPOUT)
+
+             /* FTP "aboutit" (pas d'escape) meme si le PUT echoue :        */
+             /* le vrai resultat s'analyse dans le log OUTPUT cote shell.   */
+             FTP        RMTSYS(&RMTSYS) PORT(&PORTN)
+             MONMSG     MSGID(CPF0000)
+
+             DLTOVR     FILE(INPUT)
+             MONMSG     MSGID(CPF0000)
+             DLTOVR     FILE(OUTPUT)
+             MONMSG     MSGID(CPF0000)
+
+             /* --- Exporte le log FTP vers l'IFS (819 = ASCII Latin-1) --- */
+             CPYTOSTMF  FROMMBR('/QSYS.LIB/QTEMP.LIB/FTPOUT.FILE/FTPOUT.MBR') +
+                          TOSTMF(&OUTSTMF) STMFOPT(*REPLACE) +
+                          CVTDTA(*AUTO) STMFCCSID(819)
+             MONMSG     MSGID(CPF0000)
+
+             /* --- Nettoyage --- */
+             DLTF       FILE(QTEMP/FTPIN)
+             MONMSG     MSGID(CPF0000)
+             DLTF       FILE(QTEMP/FTPOUT)
+             MONMSG     MSGID(CPF0000)
+
+             ENDPGM
