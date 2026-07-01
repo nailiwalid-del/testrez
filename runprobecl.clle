@@ -1,0 +1,112 @@
+/* ================================================================= *
+ *  RUNPROBECL - Traitement de la commande RUNPROBE.                  *
+ *  Construit la ligne shell, pose POV_FTP_PASSWORD (sauf *ENV),      *
+ *  lance netsavf_probe.sh via QSH, puis nettoie.                     *
+ *                                                                    *
+ *  Compilation :                                                     *
+ *    CRTBNDCL PGM(NETDIAGLIB/RUNPROBECL) +                           *
+ *             SRCSTMF('/home/netdiag/runprobecl.clle')               *
+ *    CRTCMD   CMD(NETDIAGLIB/RUNPROBE) PGM(NETDIAGLIB/RUNPROBECL) +  *
+ *             SRCFILE(NETDIAGLIB/QCMDSRC) SRCMBR(RUNPROBE)           *
+ *                                                                    *
+ *  Autorite : la trace TRCCNN exige *SERVICE dans le profil du job.  *
+ * ================================================================= */
+             PGM        PARM(&HOST &USER &PASSWORD &SAVFLIB &SAVF +
+                          &RMTDIR &RMTFILE &PORT &OUTDIR &SCRIPT +
+                          &FTPBLIB &FTPMODE &PINGCNT &PINGSIZE +
+                          &TRACEMB &RMTIBMI &TRACE &KEEPCOPY)
+
+             DCL        VAR(&HOST)     TYPE(*CHAR) LEN(255)
+             DCL        VAR(&USER)     TYPE(*CHAR) LEN(128)
+             DCL        VAR(&PASSWORD) TYPE(*CHAR) LEN(128)
+             DCL        VAR(&SAVFLIB)  TYPE(*CHAR) LEN(10)
+             DCL        VAR(&SAVF)     TYPE(*CHAR) LEN(10)
+             DCL        VAR(&RMTDIR)   TYPE(*CHAR) LEN(512)
+             DCL        VAR(&RMTFILE)  TYPE(*CHAR) LEN(255)
+             DCL        VAR(&PORT)     TYPE(*CHAR) LEN(5)
+             DCL        VAR(&OUTDIR)   TYPE(*CHAR) LEN(512)
+             DCL        VAR(&SCRIPT)   TYPE(*CHAR) LEN(512)
+             DCL        VAR(&FTPBLIB)  TYPE(*CHAR) LEN(10)
+             DCL        VAR(&FTPMODE)  TYPE(*CHAR) LEN(8)
+             DCL        VAR(&PINGCNT)  TYPE(*CHAR) LEN(5)
+             DCL        VAR(&PINGSIZE) TYPE(*CHAR) LEN(5)
+             DCL        VAR(&TRACEMB)  TYPE(*CHAR) LEN(6)
+             DCL        VAR(&RMTIBMI)  TYPE(*CHAR) LEN(4)
+             DCL        VAR(&TRACE)    TYPE(*CHAR) LEN(4)
+             DCL        VAR(&KEEPCOPY) TYPE(*CHAR) LEN(4)
+
+             DCL        VAR(&ARGS) TYPE(*CHAR) LEN(3500)
+             DCL        VAR(&MODE) TYPE(*CHAR) LEN(8)
+             DCL        VAR(&QCMD) TYPE(*CHAR) LEN(5000)
+             DCL        VAR(&PWSET) TYPE(*CHAR) LEN(1) VALUE('0')
+
+             MONMSG     MSGID(CPF0000 MCH0000) EXEC(GOTO CMDLBL(ERR))
+
+             /* --- Construction des arguments (obligatoires) --- */
+             CHGVAR     VAR(&ARGS) VALUE('-h' *BCAT %TRIM(&HOST))
+             CHGVAR     VAR(&ARGS) VALUE(&ARGS *BCAT '-u' *BCAT %TRIM(&USER))
+             CHGVAR     VAR(&ARGS) VALUE(&ARGS *BCAT '-l' *BCAT %TRIM(&SAVFLIB))
+             CHGVAR     VAR(&ARGS) VALUE(&ARGS *BCAT '-s' *BCAT %TRIM(&SAVF))
+             CHGVAR     VAR(&ARGS) VALUE(&ARGS *BCAT '-d' *BCAT %TRIM(&RMTDIR))
+             CHGVAR     VAR(&ARGS) VALUE(&ARGS *BCAT '-P' *BCAT %TRIM(&PORT))
+             CHGVAR     VAR(&ARGS) VALUE(&ARGS *BCAT '-o' *BCAT %TRIM(&OUTDIR))
+             CHGVAR     VAR(&ARGS) VALUE(&ARGS *BCAT '-n' *BCAT %TRIM(&PINGCNT))
+             CHGVAR     VAR(&ARGS) VALUE(&ARGS *BCAT '-b' *BCAT %TRIM(&PINGSIZE))
+             CHGVAR     VAR(&ARGS) VALUE(&ARGS *BCAT '-t' *BCAT %TRIM(&TRACEMB))
+             CHGVAR     VAR(&ARGS) VALUE(&ARGS *BCAT '-L' *BCAT %TRIM(&FTPBLIB))
+
+             /* --- Fichier distant si different de *SAVF --- */
+             IF         COND(&RMTFILE *NE '*SAVF') THEN( +
+                          CHGVAR VAR(&ARGS) VALUE(&ARGS *BCAT '-f' +
+                          *BCAT %TRIM(&RMTFILE)))
+
+             /* --- Mode FTP --- */
+             CHGVAR     VAR(&MODE) VALUE('auto')
+             IF         COND(&FTPMODE *EQ '*PASSIVE') THEN(CHGVAR VAR(&MODE) VALUE('passive'))
+             IF         COND(&FTPMODE *EQ '*ACTIVE')  THEN(CHGVAR VAR(&MODE) VALUE('active'))
+             CHGVAR     VAR(&ARGS) VALUE(&ARGS *BCAT '-M' *BCAT %TRIM(&MODE))
+
+             /* --- Bascules --- */
+             IF         COND(&RMTIBMI  *EQ '*YES') THEN(CHGVAR VAR(&ARGS) VALUE(&ARGS *BCAT '-i'))
+             IF         COND(&TRACE    *EQ '*NO')  THEN(CHGVAR VAR(&ARGS) VALUE(&ARGS *BCAT '-x'))
+             IF         COND(&KEEPCOPY *EQ '*YES') THEN(CHGVAR VAR(&ARGS) VALUE(&ARGS *BCAT '-k'))
+
+             /* --- Mot de passe : via env sauf si *ENV (deja pose) --- */
+             IF         COND(&PASSWORD *NE '*ENV') THEN(DO)
+               ADDENVVAR  ENVVAR('POV_FTP_PASSWORD') VALUE(&PASSWORD) REPLACE(*YES)
+               MONMSG     MSGID(CPF0000)
+               CHGVAR     VAR(&PWSET) VALUE('1')
+             ENDDO
+
+             /* --- Lancement du script via QSH --- */
+             CHGVAR     VAR(&QCMD) VALUE('/QOpenSys/usr/bin/sh' +
+                          *BCAT %TRIM(&SCRIPT) *BCAT %TRIM(&ARGS))
+
+             SNDPGMMSG  MSG('Lancement de la sonde vers' *BCAT +
+                          %TRIM(&HOST) *BCAT '... (sortie QSH ci-dessous)') +
+                          MSGTYPE(*STATUS) TOPGMQ(*EXT)
+
+             QSH        CMD(&QCMD)
+             MONMSG     MSGID(QSH0005 QSH0006 QSH0007 QSH0000 CPF0000) +
+                          EXEC(SNDPGMMSG MSG('QSH: code retour non nul, +
+                          voir report.txt / cl.log dans le repertoire de +
+                          sortie.') MSGTYPE(*DIAG))
+
+             /* --- Nettoyage du mot de passe --- */
+             IF         COND(&PWSET *EQ '1') THEN(DO)
+               RMVENVVAR  ENVVAR('POV_FTP_PASSWORD')
+               MONMSG     MSGID(CPF0000)
+             ENDDO
+
+             SNDPGMMSG  MSG('Sonde terminee. Rapports dans' *BCAT +
+                          %TRIM(&OUTDIR) *BCAT '(report.txt / summary.json).') +
+                          MSGTYPE(*COMP)
+             RETURN
+
+ ERR:        IF         COND(&PWSET *EQ '1') THEN(DO)
+               RMVENVVAR  ENVVAR('POV_FTP_PASSWORD')
+               MONMSG     MSGID(CPF0000)
+             ENDDO
+             SNDPGMMSG  MSG('RUNPROBE: erreur inattendue - voir joblog / cl.log.') +
+                          MSGTYPE(*ESCAPE)
+             ENDPGM
