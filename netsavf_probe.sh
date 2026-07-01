@@ -1,18 +1,22 @@
 #!/QOpenSys/usr/bin/sh
 #
-# NETSAVF Probe for IBM i (V7R2 / V7R3, 100% natif, sans open-source PASE)
+# NETSAVF Probe for IBM i - VARIANTE SANS COMPILATION (V7R2 / V7R3, 100% natif)
 # ---------------------------------------------------------------------------
 # Envoie un *SAVF IBM i vers un serveur FTP distant et produit un rapport de
 # diagnostic reseau : ping (avec bit DF si dispo), route, log FTP, debit
-# mesure au temps mural, et trace paquet TRCCNN (capture IP globale -> a
-# filtrer dans Wireshark, le filtre TCPDTA n'existant pas sur cette release).
+# mesure au temps mural, sonde de latence, et trace paquet TRCCNN (capture IP
+# globale -> a filtrer dans Wireshark, TCPDTA n'existant pas sur cette release).
 #
-# Le transfert FTP est encapsule dans le programme CL compile FTPBATCH pour
-# fiabiliser les overrides INPUT/OUTPUT (voir ftpbatch.clle).
+# Le transfert FTP est fait EN LIGNE (fonction run_ftp_native) : OVRDBF
+# INPUT/OUTPUT + FTP dans le meme job. AUCUN programme CL a compiler.
+# Repose sur OVRSCOPE(*JOB) : l'override survit entre appels 'system'
+# successifs (meme job PASE) -> a confirmer au 1er run via cl.log (le FTP doit
+# lire tes sous-commandes). Si ta PASE 'system' isole chaque commande dans un
+# job distinct (rare), la seule alternative robuste est de compiler FTPBATCH.
 #
 # Prerequis :
 #   - Shell PASE/QShell IBM i
-#   - Programme CL FTPBATCH compile dans la lib indiquee par -L (def NETDIAGLIB)
+#   - Client FTP natif (present en standard)
 #   - Commande native TRCCNN pour la trace paquet : autorite *SERVICE
 #   - Autorite d'ecriture dans le repertoire IFS de sortie
 #
@@ -27,7 +31,7 @@ set -u
 umask 077
 
 PROGRAM_NAME="netsavf_probe"
-VERSION="2.0.0"
+VERSION="2.1.0-nocompile"
 
 HOST=""
 USER_NAME=""
@@ -45,7 +49,6 @@ TRACE_ENABLED="1"
 KEEP_IFS_COPY="0"
 REMOTE_IBMI="0"
 FTP_MODE="auto"
-FTPBATCH_LIB="NETDIAGLIB"
 
 # Mot de passe : env par defaut ; -p le remplace mais declenche un avertissement.
 PASSWORD_VIA_OPT="0"
@@ -58,7 +61,7 @@ usage() {
 Usage:
   netsavf_probe.sh -h host -u user [-p password] -l SAVFLIB -s SAVF \
     -d remote_dir [-f remote_file] [-o outdir] [-P port] [-n ping_count] \
-    [-b ping_size] [-t trace_mb] [-M auto|passive|active] [-L ftpbatch_lib] \
+    [-b ping_size] [-t trace_mb] [-M auto|passive|active] \
     [-i] [-x] [-k]
 
 Requis:
@@ -80,15 +83,14 @@ Options:
   -b  Taille du gros ping (test MTU). Def : 1472
   -t  Taille table trace TRCCNN en Mo. Def : 512
   -M  Mode FTP : auto, passive, active. Def : auto
-  -L  Bibliotheque du programme FTPBATCH. Def : NETDIAGLIB
   -i  Serveur distant IBM i : envoie "quote site namefmt 1".
   -x  Desactive la trace paquet TRCCNN.
   -k  Conserve la copie IFS temporaire du SAVF.
 
 Exemple:
-  POV_FTP_PASSWORD=secret /QOpenSys/usr/bin/sh netsavf_probe.sh \
+  POV_FTP_PASSWORD=secret /QOpenSys/usr/bin/sh netsavf_probe_nc.sh \
     -h 10.10.20.30 -u FTPUSER -l MYLIB -s MYSAVF \
-    -d /incoming -f MYSAVF.savf -o /tmp/netsavf -L NETDIAGLIB
+    -d /incoming -f MYSAVF.savf -o /tmp/netsavf
 EOF
 }
 
@@ -132,7 +134,24 @@ resolve_ipv4() {
 num_gt() { awk -v n="$1" -v t="$2" 'BEGIN { exit !((n + 0) > (t + 0)) }'; }
 num_ge() { awk -v n="$1" -v t="$2" 'BEGIN { exit !((n + 0) >= (t + 0)) }'; }
 
-while getopts "h:u:p:l:s:d:f:o:P:n:b:t:M:L:ixk" opt; do
+# Horloge en millisecondes. Detecte une fois si date(1) supporte %N (GNU) ;
+# sinon retombe a la seconde (multiples de 1000) et marque TIME_COARSE=1.
+# NB : now_ms est appele en $(...) => TIME_COARSE ne peut PAS y etre affecte,
+# d'ou la detection prealable dans le scope parent.
+TIME_COARSE=0
+_ms_probe="$(date '+%s%3N' 2>/dev/null)"
+case "$_ms_probe" in
+  ''|*[!0-9]*) TIME_COARSE=1 ;;
+esac
+now_ms() {
+  if [ "$TIME_COARSE" = "0" ]; then
+    date '+%s%3N' 2>/dev/null
+  else
+    _s="$(date '+%s' 2>/dev/null || echo 0)"; printf '%s000' "$_s"
+  fi
+}
+
+while getopts "h:u:p:l:s:d:f:o:P:n:b:t:M:ixk" opt; do
   case "$opt" in
     h) HOST="$OPTARG" ;;
     u) USER_NAME="$OPTARG" ;;
@@ -147,7 +166,6 @@ while getopts "h:u:p:l:s:d:f:o:P:n:b:t:M:L:ixk" opt; do
     b) PING_SIZE="$OPTARG" ;;
     t) TRACE_MB="$OPTARG" ;;
     M) FTP_MODE="$OPTARG" ;;
-    L) FTPBATCH_LIB="$OPTARG" ;;
     i) REMOTE_IBMI="1" ;;
     x) TRACE_ENABLED="0" ;;
     k) KEEP_IFS_COPY="1" ;;
@@ -239,6 +257,38 @@ issue() {
 info_summary() { printf "%s\n" "$*" >> "$SUMMARY"; }
 
 # ---------------------------------------------------------------------------
+# Transfert FTP natif SANS programme compile.
+#   $1 = stream file d'entree (sous-commandes FTP)
+#   $2 = stream file de sortie (log FTP a produire)
+# OVRDBF INPUT/OUTPUT en OVRSCOPE(*JOB) : les overrides survivent entre les
+# appels 'system' successifs (meme job PASE), le temps du FTP. QTEMP est
+# prive au job ; on recree/nettoie a chaque appel (sonde de controle PUIS
+# transfert, sequentiels -> pas de collision).
+# ---------------------------------------------------------------------------
+run_ftp_native() {
+  _in="$1"; _out="$2"; _rc=0
+  run_cl "DLTF FILE(QTEMP/FTPIN)"  || true
+  run_cl "DLTF FILE(QTEMP/FTPOUT)" || true
+  run_cl "CRTPF FILE(QTEMP/FTPIN)  RCDLEN(512) MBR(FTPIN)  SIZE(*NOMAX)" || return 1
+  run_cl "CRTPF FILE(QTEMP/FTPOUT) RCDLEN(512) MBR(FTPOUT) SIZE(*NOMAX)" || return 1
+  run_cl "CPYFRMSTMF FROMSTMF($(clstr "$_in")) TOMBR('/QSYS.LIB/QTEMP.LIB/FTPIN.FILE/FTPIN.MBR') MBROPT(*REPLACE) CVTDTA(*AUTO)" || return 1
+  run_cl "OVRDBF FILE(INPUT)  TOFILE(QTEMP/FTPIN)  MBR(FTPIN)  OVRSCOPE(*JOB)" || return 1
+  run_cl "OVRDBF FILE(OUTPUT) TOFILE(QTEMP/FTPOUT) MBR(FTPOUT) OVRSCOPE(*JOB)" || return 1
+
+  run_cl "FTP RMTSYS($(clstr "$HOST")) PORT($PORT)"; _rc=$?
+
+  # DLTOVR LVL(*JOB) : best-effort (selon release ; sinon l'OVRDBF suivant
+  # remplace l'override, et le job en fin de vie nettoie de toute facon).
+  run_cl "DLTOVR FILE(INPUT)  LVL(*JOB)" || true
+  run_cl "DLTOVR FILE(OUTPUT) LVL(*JOB)" || true
+
+  run_cl "CPYTOSTMF FROMMBR('/QSYS.LIB/QTEMP.LIB/FTPOUT.FILE/FTPOUT.MBR') TOSTMF($(clstr "$_out")) STMFOPT(*REPLACE) CVTDTA(*AUTO) STMFCCSID(819)" || true
+  run_cl "DLTF FILE(QTEMP/FTPIN)"  || true
+  run_cl "DLTF FILE(QTEMP/FTPOUT)" || true
+  return $_rc
+}
+
+# ---------------------------------------------------------------------------
 # Gestion de la trace TRCCNN (start / stop garanti via traps)
 # ---------------------------------------------------------------------------
 cleanup_trace_started="0"
@@ -321,6 +371,20 @@ info_summary "Local SAVF copy: $LOCAL_COPY (${LOCAL_BYTES} bytes, ${LOCAL_MIB} M
 TRACE_IP="$(resolve_ipv4 "$HOST" | head -1)"
 MONITOR_MATCH="${TRACE_IP:-$HOST}"
 
+# Chronometrage de la resolution DNS (0 si HOST est deja une IP ; unknown si
+# getent absent en PASE).
+dns_ms="unknown"
+if is_ipv4 "$HOST"; then
+  dns_ms="0"
+elif command -v getent >/dev/null 2>&1; then
+  _d0="$(now_ms)"
+  getent hosts "$HOST" >/dev/null 2>&1 || true
+  _d1="$(now_ms)"
+  if is_number "$_d0" && is_number "$_d1" && [ "$_d1" -ge "$_d0" ]; then
+    dns_ms="$(awk -v a="$_d0" -v b="$_d1" 'BEGIN{ printf "%d", b-a }')"
+  fi
+fi
+
 # ---------------------------------------------------------------------------
 # 2) Ping (petit + gros avec bit DF si le ping le supporte)
 # ---------------------------------------------------------------------------
@@ -370,6 +434,48 @@ if command -v netstat >/dev/null 2>&1; then
   netstat -rn > "$NETSTAT_ROUTES" 2>&1 || true
 else
   run_cl_to "$NETSTAT_ROUTES" "NETSTAT OPTION(*RTE)" || true
+fi
+
+# ---------------------------------------------------------------------------
+# 3b) Sonde de controle (login + pwd + quit, SANS transfert de donnees).
+#     Chronometree a part -> isole cout d'etablissement + banniere + auth +
+#     quit du transport des donnees. Compare au RTT ICMP, ca distingue une
+#     lenteur "serveur/pare-feu" d'une lenteur "chemin WAN".
+# ---------------------------------------------------------------------------
+FTPIN_CTRL="$WORK/ftp_ctrl.in"
+FTPOUT_CTRL_RAW="$WORK/ftp_ctrl.raw"
+FTPOUT_CTRL="$WORK/ftp_ctrl.out"
+ctrl_ms="unknown"; ctrl_ok="no"
+
+cat > "$FTPIN_CTRL" <<EOF
+$USER_NAME $PASSWORD
+verbose
+pwd
+quit
+EOF
+if [ "$FTP_MODE" = "passive" ]; then
+  printf "sendpasv 1\n" >> "$FTPIN_CTRL"
+elif [ "$FTP_MODE" = "active" ]; then
+  printf "sendpasv 0\n" >> "$FTPIN_CTRL"
+fi
+[ "$REMOTE_IBMI" = "1" ] && printf "quote site namefmt 1\n" >> "$FTPIN_CTRL"
+
+echo "Sonde de controle FTP (etablissement/auth, sans donnees)..."
+ctrl_start_ms="$(now_ms)"
+run_ftp_native "$FTPIN_CTRL" "$FTPOUT_CTRL_RAW" || true
+ctrl_end_ms="$(now_ms)"
+rm -f "$FTPIN_CTRL"   # contient le mot de passe en clair
+
+if is_number "$ctrl_start_ms" && is_number "$ctrl_end_ms" && [ "$ctrl_end_ms" -ge "$ctrl_start_ms" ]; then
+  ctrl_ms="$(awk -v a="$ctrl_start_ms" -v b="$ctrl_end_ms" 'BEGIN{ printf "%d", b-a }')"
+fi
+if [ -s "$FTPOUT_CTRL_RAW" ]; then
+  pass_re_c="$(sed_escape_regex "$PASSWORD")"
+  sed -e "s/$pass_re_c/********/g" \
+      -e 's/[Pp][Aa][Ss][Ss][[:space:]].*/PASS ********/g' \
+      "$FTPOUT_CTRL_RAW" > "$FTPOUT_CTRL"
+  rm -f "$FTPOUT_CTRL_RAW"
+  grep -Eiq '(^|[^0-9])230([^0-9]|$)|login successful|logged on|user logged in' "$FTPOUT_CTRL" && ctrl_ok="yes"
 fi
 
 # ---------------------------------------------------------------------------
@@ -437,19 +543,14 @@ else
   issue "INFO" "Trace paquet TRCCNN desactivee (-x)." ""
 fi
 
-export POV_RMTSYS="$HOST"
-export POV_PORT="$PORT"
-export POV_INSTMF="$FTPIN"
-export POV_OUTSTMF="$FTPOUT_RAW"
-
 echo "Transfert FTP -> $HOST:$PORT $REMOTE_DIR/$REMOTE_FILE ..."
-ftp_started_epoch="$(date '+%s' 2>/dev/null || echo 0)"
-if run_cl "CALL PGM($FTPBATCH_LIB/FTPBATCH)"; then
+ftp_start_ms="$(now_ms)"
+if run_ftp_native "$FTPIN" "$FTPOUT_RAW"; then
   ftp_status="command_completed"
 else
   ftp_status="command_failed"
 fi
-ftp_ended_epoch="$(date '+%s' 2>/dev/null || echo 0)"
+ftp_end_ms="$(now_ms)"
 
 # Stop trace immediatement (la suite est locale, hors reseau).
 stop_trace "normal"
@@ -462,7 +563,7 @@ rm -f "$monitor_flag"
 rm -f "$FTPIN"
 
 # ---------------------------------------------------------------------------
-# 6) Redaction du log FTP (FTPBATCH a ecrit FTPOUT_RAW)
+# 6) Redaction du log FTP (run_ftp_native a ecrit FTPOUT_RAW)
 # ---------------------------------------------------------------------------
 if [ -s "$FTPOUT_RAW" ]; then
   pass_re="$(sed_escape_regex "$PASSWORD")"
@@ -472,7 +573,7 @@ if [ -s "$FTPOUT_RAW" ]; then
   rm -f "$FTPOUT_RAW"
 else
   echo "Log FTP absent ou vide. Voir cl.log." > "$FTPOUT"
-  issue "MAJOR" "Le log FTP est absent (FTPBATCH n'a rien produit)." "Verifier que FTPBATCH est compile dans $FTPBATCH_LIB et l'autorite FTP. Voir cl.log."
+  issue "MAJOR" "Le log FTP est absent (le transfert natif n'a rien produit)." "Verifier autorite FTP + persistance des overrides OVRSCOPE(*JOB) entre appels 'system'. Voir cl.log."
 fi
 
 # ---------------------------------------------------------------------------
@@ -545,20 +646,61 @@ else
   ftp_bytes="unknown"; ftp_secs="unknown"; ftp_rate="unknown"; ftp_mbps="unknown"
 fi
 
-wall_secs="unknown"
-if is_number "$ftp_started_epoch" && is_number "$ftp_ended_epoch" && [ "$ftp_started_epoch" -gt 0 ] && [ "$ftp_ended_epoch" -ge "$ftp_started_epoch" ]; then
-  wall_secs="$(expr "$ftp_ended_epoch" - "$ftp_started_epoch" 2>/dev/null || echo unknown)"
+wall_ms="unknown"; wall_secs="unknown"
+if is_number "$ftp_start_ms" && is_number "$ftp_end_ms" && [ "$ftp_end_ms" -ge "$ftp_start_ms" ]; then
+  wall_ms="$(awk -v a="$ftp_start_ms" -v b="$ftp_end_ms" 'BEGIN{ printf "%d", b-a }')"
+  wall_secs="$(awk -v m="$wall_ms" 'BEGIN{ printf "%.2f", m/1000 }')"
 fi
 
-# Debit PRIMAIRE = temps mural + taille reelle du fichier.
-if [ "$wall_secs" != "unknown" ] && [ "$wall_secs" -gt 0 ]; then
-  wall_mbps="$(awk -v b="$LOCAL_BYTES" -v s="$wall_secs" 'BEGIN { printf "%.2f",(b*8)/(s*1000000) }')"
+# Debit PRIMAIRE = temps mural + taille reelle du fichier. Mbps = (o*8)/(ms*1000).
+if [ "$wall_ms" != "unknown" ] && [ "$wall_ms" -gt 0 ]; then
+  wall_mbps="$(awk -v b="$LOCAL_BYTES" -v m="$wall_ms" 'BEGIN { printf "%.2f",(b*8)/(m*1000) }')"
 else
-  wall_mbps="unknown"   # transfert < 1 s : granularite date(1) insuffisante
+  wall_mbps="unknown"   # transfert trop court pour l'horloge disponible
 fi
 
 tr_hops="$(grep -E '^[[:space:]]*[0-9]+' "$TRACEROUTE_OUT" 2>/dev/null | wc -l | tr -d ' ')"
-tr_timeouts="$(grep -Ec '\* \* \*|timeout|unreachable|!H|!N|!X' "$TRACEROUTE_OUT" 2>/dev/null || echo 0)"
+# NB: grep -c sort en code 1 quand le compte est 0 -> PAS de '|| echo 0'
+# (sinon on obtient "0\n0"). On garantit une valeur par un defaut explicite.
+tr_timeouts="$(grep -Ec '\* \* \*|timeout|unreachable|!H|!N|!X' "$TRACEROUTE_OUT" 2>/dev/null)"
+[ -n "$tr_timeouts" ] || tr_timeouts="0"
+
+# RTT par hop -> hop ou la latence bondit le plus (localise le segment WAN).
+# Reserve : beaucoup de routeurs deprioritisent l'ICMP, un hop "lent" isole
+# n'est pas forcement coupable ; a correler avec ping/FTP.
+tr_jump_hop="unknown"; tr_jump_ms="unknown"; tr_hop_max_ms="unknown"
+tr_hops_file="$WORK/tr_hops.tmp"
+awk '
+  $1 ~ /^[0-9]+$/ {
+    hop=$1; rtt=""
+    for (i=2;i<=NF;i++){
+      v=$i
+      if (v ~ /^[0-9]+(\.[0-9]+)?$/ && $(i+1) ~ /^ms$/){ rtt=v; break }
+      if (v ~ /^[0-9]+(\.[0-9]+)?ms$/){ sub(/ms$/,"",v); rtt=v; break }
+    }
+    if (rtt!="") print hop, rtt
+  }' "$TRACEROUTE_OUT" > "$tr_hops_file" 2>/dev/null || true
+
+if [ -s "$tr_hops_file" ]; then
+  _jump="$(awk '
+    { hop[NR]=$1; rtt[NR]=$2 }
+    END {
+      prev=0; maxd=-1; maxhop=""; maxrtt=0
+      for (k=1;k<=NR;k++){
+        d=rtt[k]-prev
+        if (d>maxd){ maxd=d; maxhop=hop[k] }
+        if (rtt[k]>maxrtt) maxrtt=rtt[k]
+        prev=rtt[k]
+      }
+      if (maxhop!="") printf "%s %.1f %.1f", maxhop, maxd, maxrtt
+    }' "$tr_hops_file")"
+  if [ -n "$_jump" ]; then
+    tr_jump_hop="$(printf '%s' "$_jump" | awk '{print $1}')"
+    tr_jump_ms="$(printf '%s' "$_jump"  | awk '{print $2}')"
+    tr_hop_max_ms="$(printf '%s' "$_jump" | awk '{print $3}')"
+  fi
+fi
+rm -f "$tr_hops_file"
 
 # ---------------------------------------------------------------------------
 # 9) Detection des problemes
@@ -567,8 +709,10 @@ if [ -s "$ftp_errors_file" ]; then
   first_errors="$(head -5 "$ftp_errors_file" | tr '\n' '; ')"
   issue "CRITICAL" "FTP a signale des erreurs ou symptomes de connexion." "$first_errors"
 fi
-if grep -Eiq '425|426|PORT|PASV|passive|data connection|cannot open data|failed to establish data' "$FTPOUT"; then
-  issue "MAJOR" "Probleme possible du canal DATA FTP (firewall/NAT)." "Essayer active/passive et verifier les regles du canal data."
+# Uniquement de VRAIES erreurs de canal data (pas la simple presence de PASV,
+# qui apparait dans toute session passive reussie).
+if grep -Eiq '425|426|cannot open data|can.t open data|failed to establish data|data connection.*(refused|timed out|time out|failed|reset|closed)' "$FTPOUT"; then
+  issue "MAJOR" "Probleme du canal DATA FTP (firewall/NAT)." "Essayer active/passive et verifier les regles du canal data."
 fi
 if grep -Eiq '530|login incorrect|not logged in' "$FTPOUT"; then
   issue "CRITICAL" "Authentification FTP echouee." "Verifier user/mot de passe/restrictions du serveur distant."
@@ -623,6 +767,50 @@ if [ -s "$PCAP_ANALYSIS" ]; then
   fi
 fi
 
+# ---------------------------------------------------------------------------
+# 9b) Attribution de la latence dominante (heuristique, priorite descendante)
+#     PERTE > SETUP_SERVEUR/PAREFEU > CHEMIN_WAN > DNS > SETUP_CONNEXION.
+# ---------------------------------------------------------------------------
+lat_source="AUCUNE_DOMINANTE"
+lat_detail="Pas de source de latence dominante identifiee automatiquement."
+
+loss_present=0
+[ "$small_loss" != "unknown" ] && num_gt "$small_loss" "0" && loss_present=1
+[ "$retrans" != "unknown" ] && num_gt "$retrans" "0" && loss_present=1
+
+if [ "$loss_present" = "1" ]; then
+  lat_source="PERTE_RESEAU"
+  lat_detail="Perte/retransmissions -> latence effective par reemissions (small_loss=${small_loss}% retrans=${retrans})."
+elif [ "$ctrl_ok" = "yes" ] && [ "$ctrl_ms" != "unknown" ] && \
+     awk -v c="$ctrl_ms" -v r="$small_avg" 'BEGIN{ thr=1500; if(r+0>0 && 8*r>thr) thr=8*r; exit !(c+0>thr) }'; then
+  lat_source="SETUP_SERVEUR_PAREFEU"
+  lat_detail="Session de controle lente (${ctrl_ms} ms) vs RTT ICMP ${small_avg} ms -> etablissement/auth/pare-feu, pas le chemin."
+elif [ "$small_avg" != "unknown" ] && num_gt "$small_avg" "100"; then
+  lat_source="CHEMIN_WAN"
+  lat_detail="RTT ICMP eleve (${small_avg} ms)"
+  if [ "$tr_jump_hop" != "unknown" ]; then
+    lat_detail="$lat_detail ; bond de latence au hop ${tr_jump_hop} (+${tr_jump_ms} ms)"
+  fi
+  lat_detail="$lat_detail."
+elif [ "$dns_ms" != "unknown" ] && num_gt "$dns_ms" "500"; then
+  lat_source="DNS"
+  lat_detail="Resolution DNS lente (${dns_ms} ms)."
+elif [ "$wall_mbps" != "unknown" ] && [ "$ftp_mbps" != "unknown" ] && \
+     num_gt "$ftp_mbps" "0" && num_gt "$wall_mbps" "0" && \
+     awk -v w="$wall_mbps" -v f="$ftp_mbps" 'BEGIN{ exit !(f > w*1.3) }'; then
+  lat_source="SETUP_CONNEXION"
+  lat_detail="Debit mural (${wall_mbps}) << phase-data (${ftp_mbps} Mbit/s) : cout d'etablissement de connexion."
+fi
+
+if [ "$lat_source" != "AUCUNE_DOMINANTE" ]; then
+  lat_sev="INFO"
+  case "$lat_source" in
+    PERTE_RESEAU|SETUP_SERVEUR_PAREFEU) lat_sev="MAJOR" ;;
+  esac
+  issue "$lat_sev" "Latence dominante : $lat_source." "$lat_detail"
+fi
+[ "$TIME_COARSE" = "1" ] && issue "INFO" "Horloge shell en secondes (date sans %N) : timings de phase arrondis." "Precision ms via le PCAP (Wireshark) uniquement."
+
 if grep -Eiq 'Transfer complete|226 ' "$FTPOUT" && [ ! -s "$ftp_errors_file" ]; then
   ftp_result="OK"
 else
@@ -635,7 +823,8 @@ if   grep -q '^\[CRITICAL\]' "$ISSUES"; then top_severity="CRITICAL"
 elif grep -q '^\[MAJOR\]'    "$ISSUES"; then top_severity="MAJOR"
 elif grep -q '^\[INFO\]'     "$ISSUES"; then top_severity="INFO"
 else top_severity="OK"; fi
-issues_count="$(grep -c '^\[' "$ISSUES" 2>/dev/null || echo 0)"
+issues_count="$(grep -c '^\[' "$ISSUES" 2>/dev/null)"
+[ -n "$issues_count" ] || issues_count="0"
 
 # ---------------------------------------------------------------------------
 # 10) Rapport humain
@@ -664,6 +853,23 @@ issues_count="$(grep -c '^\[' "$ISSUES" 2>/dev/null || echo 0)"
   echo "Traceroute hops/to    : $tr_hops / $tr_timeouts"
   echo "PCAP retrans/lost/dup : ${retrans} / ${lostseg} / ${dupack}"
   echo
+  echo "Repartition de la latence"
+  echo "-------------------------"
+  echo "Source dominante      : $lat_source"
+  echo "Detail                : ${lat_detail}"
+  echo "Resolution DNS        : ${dns_ms} ms"
+  echo "RTT ICMP (petit ping) : ${small_avg} ms"
+  echo "Sonde controle FTP    : ${ctrl_ms} ms (login_ok=${ctrl_ok}) [connexion+banniere+auth+quit]"
+  echo "Bond RTT traceroute   : hop ${tr_jump_hop} (+${tr_jump_ms} ms) ; max hop=${tr_hop_max_ms} ms"
+  echo "Setup vs data (debit) : mural=${wall_mbps} / phase-data=${ftp_mbps} Mbit/s"
+  if [ "$TIME_COARSE" = "1" ]; then
+    echo "  ATTENTION horloge en secondes (date sans %N) -> timings arrondis au millier de ms."
+    echo "  Pour la precision ms (handshake/TTFB), analyser le PCAP dans Wireshark."
+  fi
+  echo "  Methode : la sonde de controle isole etablissement+auth du transport ;"
+  echo "  comparee au RTT ICMP, elle distingue 'serveur/pare-feu' de 'chemin WAN'."
+  echo "  Ambiguite residuelle serveur<->pare-feu : lever avec une 2e capture cote distant."
+  echo
   echo "Constats detectes"
   echo "-----------------"
   cat "$ISSUES"
@@ -687,6 +893,7 @@ issues_count="$(grep -c '^\[' "$ISSUES" 2>/dev/null || echo 0)"
   echo "Rapport            : $REPORT"
   echo "Resume machine     : $SUMMARY_JSON"
   echo "Log FTP (redige)   : $FTPOUT"
+  echo "Sonde controle     : $FTPOUT_CTRL"
   echo "Entree FTP (redige): $FTPIN_SAFE"
   echo "Log CL             : $CLLOG"
   echo "Ping petit / gros  : $PING_SMALL / $PING_LARGE"
@@ -744,6 +951,15 @@ issues_count="$(grep -c '^\[' "$ISSUES" 2>/dev/null || echo 0)"
   printf '  "pcap_duplicate_acks": %s,\n'  "$(jnum "$dupack")"
   printf '  "trace_window_start": %s,\n'   "$(jstr "${trace_win_start:-}")"
   printf '  "trace_window_stop": %s,\n'    "$(jstr "${trace_win_stop:-}")"
+  printf '  "dns_ms": %s,\n'          "$(jnum "$dns_ms")"
+  printf '  "ctrl_ms": %s,\n'         "$(jnum "$ctrl_ms")"
+  printf '  "ctrl_login_ok": %s,\n'   "$(jstr "$ctrl_ok")"
+  printf '  "wall_ms": %s,\n'         "$(jnum "$wall_ms")"
+  printf '  "tr_jump_hop": %s,\n'     "$(jnum "$tr_jump_hop")"
+  printf '  "tr_jump_ms": %s,\n'      "$(jnum "$tr_jump_ms")"
+  printf '  "tr_hop_max_ms": %s,\n'   "$(jnum "$tr_hop_max_ms")"
+  printf '  "time_coarse": %s,\n'     "$(jnum "$TIME_COARSE")"
+  printf '  "latency_source": %s,\n'  "$(jstr "$lat_source")"
   printf '  "top_severity": %s,\n'    "$(jstr "$top_severity")"
   printf '  "issues_count": %s,\n'    "$(jnum "$issues_count")"
   printf '  "pcap_path": %s,\n'       "$(jstr "$PCAP")"
