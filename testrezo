@@ -1,0 +1,720 @@
+#!/QOpenSys/usr/bin/sh
+#
+# NETSAVF Probe for IBM i
+# Sends an IBM i *SAVF to a remote FTP server and creates a network
+# diagnostic report with ping, route, FTP log, TRCCNN PCAP trace, and
+# optional Wireshark/tshark analysis if tshark is installed in PASE.
+#
+# Requirements:
+#   - IBM i PASE/QShell shell
+#   - Native IBM i FTP command
+#   - Native TRCCNN command for packet trace, requiring *SERVICE authority
+#   - Write authority to the output IFS directory
+#
+# Notes:
+#   - FTP is clear text. Use this as a diagnostic transfer or inside a trusted
+#     network. For production payloads, prefer SFTP/FTPS with keys/certificates.
+#   - Passwords with spaces or newlines are not supported by native FTP batch.
+
+set -u
+umask 077
+
+PROGRAM_NAME="netsavf_probe"
+VERSION="1.0.0"
+
+HOST=""
+USER_NAME=""
+PASSWORD=""
+SAVF_LIB=""
+SAVF_NAME=""
+REMOTE_DIR=""
+REMOTE_FILE=""
+OUTDIR="/tmp/netsavf"
+PORT="21"
+PING_COUNT="20"
+PING_SIZE="1472"
+TRACE_MB="360"
+TRACE_ENABLED="1"
+KEEP_IFS_COPY="0"
+REMOTE_IBMI="0"
+FTP_MODE="auto"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  netsavf_probe.sh -h host -u user -p password -l SAVFLIB -s SAVF \
+    -d remote_dir [-f remote_file] [-o outdir] [-P port] [-n ping_count] \
+    [-b ping_size] [-t trace_mb] [-M auto|passive|active] [-i] [-x] [-k]
+
+Required:
+  -h  Remote FTP host or IP.
+  -u  FTP user.
+  -p  FTP password. Avoid spaces/newlines.
+  -l  IBM i library containing the save file.
+  -s  IBM i save file object name.
+  -d  Remote directory/path on the FTP server.
+
+Options:
+  -f  Remote file name. Default: SAVF.savf
+  -o  Output directory for report and artifacts. Default: /tmp/netsavf
+  -P  FTP port. Default: 21
+  -n  Ping packet count. Default: 20
+  -b  Large ping payload size. Default: 1472
+  -t  TRCCNN trace table size in MB. Default: 360
+  -M  FTP mode hint: auto, passive, or active. Default: auto
+  -i  Remote server is IBM i: sends "quote site namefmt 1" before cd/put.
+  -x  Disable TRCCNN packet trace.
+  -k  Keep the temporary IFS copy of the SAVF in the work directory.
+
+Example:
+  /QOpenSys/usr/bin/sh /home/netdiag/netsavf_probe.sh \
+    -h 10.10.20.30 -u FTPUSER -p secret -l MYLIB -s MYSAVF \
+    -d /incoming -f MYSAVF.savf -o /tmp/netsavf
+EOF
+}
+
+fatal() {
+  echo "ERROR: $*" >&2
+  exit 1
+}
+
+warn_stdout() {
+  echo "WARN: $*" >&2
+}
+
+is_number() {
+  case "$1" in
+    ''|*[!0-9]*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+upper() {
+  printf "%s" "$1" | tr '[:lower:]' '[:upper:]'
+}
+
+sanitize_name() {
+  printf "%s" "$1" | sed 's/[^A-Za-z0-9_.-]/_/g'
+}
+
+clstr() {
+  printf "'%s'" "$(printf "%s" "$1" | sed "s/'/''/g")"
+}
+
+sed_escape_regex() {
+  printf "%s" "$1" | sed 's/[.[\*^$()+?{}|\\/]/\\&/g'
+}
+
+is_ipv4() {
+  printf "%s" "$1" | awk -F. '
+    NF != 4 { exit 1 }
+    {
+      for (i = 1; i <= 4; i++) {
+        if ($i !~ /^[0-9]+$/ || $i < 0 || $i > 255) exit 1
+      }
+      exit 0
+    }'
+}
+
+resolve_ipv4() {
+  if is_ipv4 "$1"; then
+    printf "%s" "$1"
+    return 0
+  fi
+
+  if command -v getent >/dev/null 2>&1; then
+    getent hosts "$1" 2>/dev/null | awk '
+      $1 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ { print $1; exit }'
+    return 0
+  fi
+
+  return 1
+}
+
+num_gt() {
+  awk -v n="$1" -v t="$2" 'BEGIN { exit !((n + 0) > (t + 0)) }'
+}
+
+num_ge() {
+  awk -v n="$1" -v t="$2" 'BEGIN { exit !((n + 0) >= (t + 0)) }'
+}
+
+while getopts "h:u:p:l:s:d:f:o:P:n:b:t:M:ixk" opt; do
+  case "$opt" in
+    h) HOST="$OPTARG" ;;
+    u) USER_NAME="$OPTARG" ;;
+    p) PASSWORD="$OPTARG" ;;
+    l) SAVF_LIB="$OPTARG" ;;
+    s) SAVF_NAME="$OPTARG" ;;
+    d) REMOTE_DIR="$OPTARG" ;;
+    f) REMOTE_FILE="$OPTARG" ;;
+    o) OUTDIR="$OPTARG" ;;
+    P) PORT="$OPTARG" ;;
+    n) PING_COUNT="$OPTARG" ;;
+    b) PING_SIZE="$OPTARG" ;;
+    t) TRACE_MB="$OPTARG" ;;
+    M) FTP_MODE="$OPTARG" ;;
+    i) REMOTE_IBMI="1" ;;
+    x) TRACE_ENABLED="0" ;;
+    k) KEEP_IFS_COPY="1" ;;
+    *) usage; exit 2 ;;
+  esac
+done
+
+[ -n "$HOST" ] || { usage; exit 2; }
+[ -n "$USER_NAME" ] || { usage; exit 2; }
+[ -n "$PASSWORD" ] || { usage; exit 2; }
+[ -n "$SAVF_LIB" ] || { usage; exit 2; }
+[ -n "$SAVF_NAME" ] || { usage; exit 2; }
+[ -n "$REMOTE_DIR" ] || { usage; exit 2; }
+
+is_number "$PORT" || fatal "-P port must be numeric"
+is_number "$PING_COUNT" || fatal "-n ping_count must be numeric"
+is_number "$PING_SIZE" || fatal "-b ping_size must be numeric"
+is_number "$TRACE_MB" || fatal "-t trace_mb must be numeric"
+
+case "$FTP_MODE" in
+  auto|passive|active) ;;
+  *) fatal "-M must be auto, passive, or active" ;;
+esac
+
+if printf "%s" "$PASSWORD" | grep '[[:space:]]' >/dev/null 2>&1; then
+  fatal "Password with spaces/newlines is not supported by native FTP batch"
+fi
+
+if printf "%s" "$REMOTE_DIR$REMOTE_FILE" | grep '[[:space:]]' >/dev/null 2>&1; then
+  fatal "Remote path/file must not contain spaces/newlines"
+fi
+
+SAVF_LIB="$(upper "$SAVF_LIB")"
+SAVF_NAME="$(upper "$SAVF_NAME")"
+[ -n "$REMOTE_FILE" ] || REMOTE_FILE="${SAVF_NAME}.savf"
+
+if command -v system >/dev/null 2>&1; then
+  SYSTEM_CMD="system"
+elif [ -x /QOpenSys/usr/bin/system ]; then
+  SYSTEM_CMD="/QOpenSys/usr/bin/system"
+else
+  fatal "Cannot find IBM i 'system' utility in PASE"
+fi
+
+TS="$(date '+%Y%m%d_%H%M%S' 2>/dev/null || date)"
+SAFE_HOST="$(sanitize_name "$HOST")"
+RUN_ID="${PROGRAM_NAME}_${SAFE_HOST}_${TS}_$$"
+WORK="${OUTDIR%/}/$RUN_ID"
+mkdir -p "$WORK" || fatal "Cannot create output directory: $WORK"
+
+REPORT="$WORK/report.txt"
+CLLOG="$WORK/cl.log"
+FTPIN="$WORK/ftp.in"
+FTPIN_SAFE="$WORK/ftp.in.redacted"
+FTPOUT_RAW="$WORK/ftp.raw"
+FTPOUT="$WORK/ftp.out"
+PING_SMALL="$WORK/ping_small.out"
+PING_LARGE="$WORK/ping_large.out"
+TRACEROUTE_OUT="$WORK/traceroute.out"
+NETSTAT_ROUTES="$WORK/netstat_routes.out"
+NETSTAT_CONNS="$WORK/netstat_connections.out"
+PCAP="$WORK/trccnn.pcap"
+PCAP_ANALYSIS="$WORK/pcap_analysis.out"
+ISSUES="$WORK/issues.tmp"
+SUMMARY="$WORK/summary.tmp"
+
+: > "$CLLOG"
+: > "$ISSUES"
+: > "$SUMMARY"
+
+run_cl() {
+  echo "CL> $*" >> "$CLLOG"
+  "$SYSTEM_CMD" "$*" >> "$CLLOG" 2>&1
+}
+
+run_cl_to() {
+  _out="$1"
+  shift
+  echo "CL> $*" >> "$CLLOG"
+  "$SYSTEM_CMD" "$*" >> "$_out" 2>&1
+}
+
+issue() {
+  sev="$1"
+  text="$2"
+  evidence="$3"
+  {
+    printf "[%s] %s\n" "$sev" "$text"
+    [ -n "$evidence" ] && printf "  Evidence: %s\n" "$evidence"
+  } >> "$ISSUES"
+}
+
+info_summary() {
+  printf "%s\n" "$*" >> "$SUMMARY"
+}
+
+cleanup_trace_started="0"
+cleanup_in_progress="0"
+trace_table=""
+
+stop_trace() {
+  reason="$1"
+  if [ "$cleanup_trace_started" = "1" ] && [ -n "$trace_table" ]; then
+    if [ "$cleanup_in_progress" = "1" ]; then
+      return 0
+    fi
+
+    cleanup_in_progress="1"
+
+    if [ "$reason" = "normal" ]; then
+      echo "Stopping TRCCNN and writing PCAP..."
+    else
+      echo "Stopping TRCCNN after $reason and writing PCAP if possible..." >&2
+      issue "INFO" "TRCCNN cleanup triggered before normal completion." "reason=$reason trace_table=$trace_table"
+    fi
+
+    if run_cl "TRCCNN SET(*OFF) TRCTBL($trace_table) OUTPUT(*STMF) TOSTMF($(clstr "$PCAP") *YES)"; then
+      info_summary "TRCCNN PCAP: $PCAP"
+    else
+      issue "MAJOR" "TRCCNN packet trace could not be dumped to PCAP." "Trace table=$trace_table. A forced SET(*END) is attempted next; see cl.log."
+    fi
+
+    # Always end the trace table after the dump attempt so packet capture
+    # cannot remain active after a failed transfer or interrupted script.
+    run_cl "TRCCNN SET(*END) TRCTBL($trace_table)" || true
+    cleanup_trace_started="0"
+    cleanup_in_progress="0"
+  fi
+}
+
+cleanup_exit() {
+  status=$?
+  trap - EXIT HUP INT QUIT TERM
+  stop_trace "exit_status=$status"
+  exit "$status"
+}
+
+cleanup_signal() {
+  sig="$1"
+  code="$2"
+  trap - EXIT HUP INT QUIT TERM
+  stop_trace "signal $sig"
+  exit "$code"
+}
+
+trap cleanup_exit EXIT
+trap 'cleanup_signal HUP 129' HUP
+trap 'cleanup_signal INT 130' INT
+trap 'cleanup_signal QUIT 131' QUIT
+trap 'cleanup_signal TERM 143' TERM
+
+echo "Work directory: $WORK"
+info_summary "Work directory: $WORK"
+
+SAVF_QSYS="/QSYS.LIB/${SAVF_LIB}.LIB/${SAVF_NAME}.FILE"
+LOCAL_BASENAME="${SAVF_NAME}.savf"
+LOCAL_COPY="$WORK/$LOCAL_BASENAME"
+
+echo "Checking and copying $SAVF_LIB/$SAVF_NAME to IFS..."
+if ! run_cl "CHKOBJ OBJ($SAVF_LIB/$SAVF_NAME) OBJTYPE(*FILE)"; then
+  fatal "Object $SAVF_LIB/$SAVF_NAME was not found or is not accessible. See $CLLOG"
+fi
+
+if ! run_cl "CPYTOSTMF FROMMBR($(clstr "$SAVF_QSYS")) TOSTMF($(clstr "$LOCAL_COPY")) STMFOPT(*REPLACE) CVTDTA(*NONE)"; then
+  fatal "Cannot copy SAVF to IFS stream file. See $CLLOG"
+fi
+
+LOCAL_BYTES="$(wc -c < "$LOCAL_COPY" | tr -d ' ')"
+LOCAL_MIB="$(awk -v b="$LOCAL_BYTES" 'BEGIN { printf "%.2f", b / 1048576 }')"
+info_summary "Local SAVF copy: $LOCAL_COPY (${LOCAL_BYTES} bytes, ${LOCAL_MIB} MiB)"
+
+TRACE_IP="$(resolve_ipv4 "$HOST" | head -1)"
+if [ "$TRACE_ENABLED" = "1" ]; then
+  pid2="$(expr $$ % 100 2>/dev/null || echo 0)"
+  trace_table="PV$(date '+%H%M%S' 2>/dev/null)$(printf '%02d' "$pid2")"
+  trace_table="$(printf "%s" "$trace_table" | cut -c1-10)"
+  trace_cmd="TRCCNN SET(*ON) TRCTYPE(*IP) TRCTBL($trace_table) SIZE($TRACE_MB *MB)"
+  if [ -n "$TRACE_IP" ]; then
+    trace_cmd="$trace_cmd TCPDTA(*N () () *N '$TRACE_IP')"
+  else
+    issue "INFO" "TRCCNN started without remote-IP filter because the host could not be resolved to IPv4." "Host=$HOST"
+  fi
+
+  echo "Starting TRCCNN packet trace..."
+  if run_cl "$trace_cmd"; then
+    cleanup_trace_started="1"
+    info_summary "TRCCNN trace table: $trace_table"
+  else
+    issue "MAJOR" "TRCCNN packet trace could not be started." "Usually missing *SERVICE authority or insufficient ASP free space. See cl.log."
+    cleanup_trace_started="0"
+  fi
+else
+  issue "INFO" "TRCCNN packet trace disabled by -x." ""
+fi
+
+run_ping() {
+  size="$1"
+  out="$2"
+  if command -v ping >/dev/null 2>&1; then
+    echo "PASE ping -c $PING_COUNT -s $size $HOST" > "$out"
+    ping -c "$PING_COUNT" -s "$size" "$HOST" >> "$out" 2>&1
+    return $?
+  fi
+
+  echo "Native VFYTCPCNN fallback" > "$out"
+  if is_ipv4 "$HOST"; then
+    run_cl_to "$out" "VFYTCPCNN RMTSYS(*INTNETADR) INTNETADR('$HOST') PKTLEN($size) NBRPKT($PING_COUNT) WAITTIME(5) MSGMODE(*QUIET)"
+    return $?
+  fi
+
+  echo "No PASE ping available and native fallback requires an IPv4 address." >> "$out"
+  return 1
+}
+
+echo "Running ping checks..."
+run_ping "56" "$PING_SMALL" || true
+run_ping "$PING_SIZE" "$PING_LARGE" || true
+
+echo "Collecting route information..."
+if command -v traceroute >/dev/null 2>&1; then
+  traceroute "$HOST" > "$TRACEROUTE_OUT" 2>&1 || true
+else
+  echo "traceroute command not available in PASE." > "$TRACEROUTE_OUT"
+fi
+
+if command -v netstat >/dev/null 2>&1; then
+  netstat -rn > "$NETSTAT_ROUTES" 2>&1 || true
+else
+  run_cl_to "$NETSTAT_ROUTES" "NETSTAT OPTION(*RTE)" || true
+fi
+
+cat > "$FTPIN" <<EOF
+$USER_NAME $PASSWORD
+verbose
+debug
+EOF
+
+if [ "$FTP_MODE" = "passive" ]; then
+  printf "sendpasv 1\n" >> "$FTPIN"
+elif [ "$FTP_MODE" = "active" ]; then
+  printf "sendpasv 0\n" >> "$FTPIN"
+  printf "sendport 1\n" >> "$FTPIN"
+fi
+
+if [ "$REMOTE_IBMI" = "1" ]; then
+  printf "quote site namefmt 1\n" >> "$FTPIN"
+fi
+
+cat >> "$FTPIN" <<EOF
+bin
+lcd $WORK
+cd $REMOTE_DIR
+put $LOCAL_BASENAME $REMOTE_FILE
+quit
+EOF
+
+sed '1s/.*/'"$USER_NAME"' ********/' "$FTPIN" > "$FTPIN_SAFE"
+
+pid6="$(expr $$ % 1000000 2>/dev/null || echo $$)"
+pid6="$(printf "%06d" "$pid6" | sed 's/.*\(......\)$/\1/')"
+INPF="PI$pid6"
+OUTPF="PO$pid6"
+
+ftp_status="unknown"
+ftp_started_epoch="$(date '+%s' 2>/dev/null || echo 0)"
+
+echo "Preparing native FTP batch files..."
+if ! run_cl "CRTPF FILE(QTEMP/$INPF) RCDLEN(512)"; then
+  fatal "Cannot create QTEMP/$INPF. See $CLLOG"
+fi
+run_cl "ADDPFM FILE(QTEMP/$INPF) MBR($INPF)" || true
+
+if ! run_cl "CRTPF FILE(QTEMP/$OUTPF) RCDLEN(512)"; then
+  fatal "Cannot create QTEMP/$OUTPF. See $CLLOG"
+fi
+run_cl "ADDPFM FILE(QTEMP/$OUTPF) MBR($OUTPF)" || true
+
+if ! run_cl "CPYFRMSTMF FROMSTMF($(clstr "$FTPIN")) TOMBR($(clstr "/QSYS.LIB/QTEMP.LIB/$INPF.FILE/$INPF.MBR")) MBROPT(*REPLACE) CVTDTA(*AUTO)"; then
+  fatal "Cannot copy FTP input into QTEMP. See $CLLOG"
+fi
+rm -f "$FTPIN"
+
+run_cl "OVRDBF FILE(INPUT) TOFILE(QTEMP/$INPF) MBR($INPF) OVRSCOPE(*JOB)" || fatal "Cannot override FTP INPUT. See $CLLOG"
+run_cl "OVRDBF FILE(OUTPUT) TOFILE(QTEMP/$OUTPF) MBR($OUTPF) OVRSCOPE(*JOB)" || fatal "Cannot override FTP OUTPUT. See $CLLOG"
+
+monitor_flag="$WORK/monitor.on"
+monitor_pid=""
+if command -v netstat >/dev/null 2>&1; then
+  : > "$monitor_flag"
+  (
+    while [ -f "$monitor_flag" ]; do
+      date
+      netstat -an 2>/dev/null | grep -F "$HOST" || true
+      sleep 2
+    done
+  ) > "$NETSTAT_CONNS" 2>&1 &
+  monitor_pid="$!"
+else
+  echo "netstat command not available in PASE." > "$NETSTAT_CONNS"
+fi
+
+echo "Starting FTP transfer to $HOST:$PORT $REMOTE_DIR/$REMOTE_FILE ..."
+if run_cl "FTP RMTSYS($(clstr "$HOST")) PORT($PORT)"; then
+  ftp_status="command_completed"
+else
+  ftp_status="command_failed"
+fi
+ftp_ended_epoch="$(date '+%s' 2>/dev/null || echo 0)"
+
+rm -f "$monitor_flag"
+if [ -n "$monitor_pid" ]; then
+  wait "$monitor_pid" 2>/dev/null || true
+fi
+
+run_cl "DLTOVR FILE(INPUT)" || true
+run_cl "DLTOVR FILE(OUTPUT)" || true
+
+if run_cl "CPYTOSTMF FROMMBR($(clstr "/QSYS.LIB/QTEMP.LIB/$OUTPF.FILE/$OUTPF.MBR")) TOSTMF($(clstr "$FTPOUT_RAW")) STMFOPT(*REPLACE) CVTDTA(*AUTO)"; then
+  pass_re="$(sed_escape_regex "$PASSWORD")"
+  sed -e "s/$pass_re/********/g" \
+      -e 's/[Pp][Aa][Ss][Ss][[:space:]].*/PASS ********/g' \
+      "$FTPOUT_RAW" > "$FTPOUT"
+  rm -f "$FTPOUT_RAW"
+else
+  echo "Could not export native FTP output. See cl.log." > "$FTPOUT"
+  issue "MAJOR" "FTP output log could not be copied from QTEMP." "See cl.log."
+fi
+
+run_cl "DLTF FILE(QTEMP/$INPF)" || true
+run_cl "DLTF FILE(QTEMP/$OUTPF)" || true
+
+stop_trace "normal"
+
+if command -v tshark >/dev/null 2>&1 && [ -s "$PCAP" ]; then
+  {
+    echo "tshark TCP conversations:"
+    tshark -r "$PCAP" -q -z conv,tcp 2>/dev/null || true
+    echo
+    echo "TCP analysis counters:"
+    printf "retransmissions="
+    tshark -r "$PCAP" -Y "tcp.analysis.retransmission" -T fields -e frame.number 2>/dev/null | wc -l | tr -d ' '
+    echo
+    printf "lost_segments="
+    tshark -r "$PCAP" -Y "tcp.analysis.lost_segment" -T fields -e frame.number 2>/dev/null | wc -l | tr -d ' '
+    echo
+    printf "duplicate_acks="
+    tshark -r "$PCAP" -Y "tcp.analysis.duplicate_ack" -T fields -e frame.number 2>/dev/null | wc -l | tr -d ' '
+    echo
+  } > "$PCAP_ANALYSIS"
+else
+  echo "tshark not available or PCAP missing. Open the PCAP with Wireshark for TCP retransmission/loss analysis." > "$PCAP_ANALYSIS"
+fi
+
+parse_loss() {
+  awk '
+    /packet loss/ {
+      for (i = 1; i <= NF; i++) {
+        if ($i ~ /%/) {
+          gsub(/[,()%]/, "", $i)
+          print $i
+          exit
+        }
+      }
+    }
+    /successful/ && /%/ {
+      for (i = 1; i <= NF; i++) {
+        if ($i ~ /%/) {
+          gsub(/[,()%]/, "", $i)
+          print 100 - $i
+          exit
+        }
+      }
+    }' "$1" | tail -1
+}
+
+parse_avg_rtt() {
+  awk '
+    /min\/avg\/max/ {
+      for (i = 1; i <= NF; i++) {
+        if ($i == "=" && (i + 1) <= NF) {
+          split($(i + 1), a, "/")
+          print a[2]
+          exit
+        }
+      }
+      split($NF, a, "/")
+      if (a[2] != "") print a[2]
+    }' "$1" | tail -1
+}
+
+small_loss="$(parse_loss "$PING_SMALL")"
+large_loss="$(parse_loss "$PING_LARGE")"
+small_avg="$(parse_avg_rtt "$PING_SMALL")"
+large_avg="$(parse_avg_rtt "$PING_LARGE")"
+
+[ -n "$small_loss" ] || small_loss="unknown"
+[ -n "$large_loss" ] || large_loss="unknown"
+[ -n "$small_avg" ] || small_avg="unknown"
+[ -n "$large_avg" ] || large_avg="unknown"
+
+transfer_line="$(grep -i "bytes transferred in" "$FTPOUT" | tail -1 || true)"
+ftp_errors_file="$WORK/ftp_errors.tmp"
+grep -En '(^|[[:space:]])[45][0-9][0-9]([ -]|$)|timed out|timeout|refused|reset|not connected|no route|unreachable|permission denied|broken pipe|failed|cannot|425|426|530|550' "$FTPOUT" > "$ftp_errors_file" 2>/dev/null || true
+
+if [ -n "$transfer_line" ]; then
+  ftp_bytes="$(printf "%s\n" "$transfer_line" | awk '{ print $1 }')"
+  ftp_secs="$(printf "%s\n" "$transfer_line" | awk '{ print $5 }')"
+  ftp_rate="$(printf "%s\n" "$transfer_line" | awk '{ print $(NF-1) " " $NF }')"
+  ftp_mbps="$(awk -v b="$ftp_bytes" -v s="$ftp_secs" 'BEGIN { if (s > 0) printf "%.2f", (b * 8) / (s * 1000000); else print "unknown" }')"
+else
+  ftp_bytes="unknown"
+  ftp_secs="unknown"
+  ftp_rate="unknown"
+  ftp_mbps="unknown"
+fi
+
+wall_secs="unknown"
+if is_number "$ftp_started_epoch" && is_number "$ftp_ended_epoch" && [ "$ftp_started_epoch" -gt 0 ] && [ "$ftp_ended_epoch" -ge "$ftp_started_epoch" ]; then
+  wall_secs="$(expr "$ftp_ended_epoch" - "$ftp_started_epoch" 2>/dev/null || echo unknown)"
+fi
+
+tr_hops="$(grep -E '^[[:space:]]*[0-9]+' "$TRACEROUTE_OUT" 2>/dev/null | wc -l | tr -d ' ')"
+tr_timeouts="$(grep -Ec '\* \* \*|timeout|unreachable|!H|!N|!X' "$TRACEROUTE_OUT" 2>/dev/null || echo 0)"
+
+if [ -s "$ftp_errors_file" ]; then
+  first_errors="$(head -5 "$ftp_errors_file" | tr '\n' '; ')"
+  issue "CRITICAL" "FTP reported errors or connection symptoms." "$first_errors"
+fi
+
+if grep -Eiq '425|426|PORT|PASV|passive|data connection|cannot open data|failed to establish data' "$FTPOUT"; then
+  issue "MAJOR" "Possible FTP data-channel firewall/NAT issue." "Try switching active/passive mode and check firewall rules for the FTP data channel."
+fi
+
+if grep -Eiq '530|login incorrect|not logged in' "$FTPOUT"; then
+  issue "CRITICAL" "FTP authentication failed." "Check user/password/account restrictions on the remote server."
+fi
+
+if grep -Eiq '550|permission denied|no such file|not found|access denied' "$FTPOUT"; then
+  issue "MAJOR" "Remote path, file, or authority problem." "Check directory=$REMOTE_DIR and remote file=$REMOTE_FILE."
+fi
+
+if grep -Eiq 'timed out|timeout|connection refused|no route|unreachable|connection reset' "$FTPOUT"; then
+  issue "CRITICAL" "Connectivity failure between IBM i and remote FTP service." "Check route, firewall, remote service listener, and NAT."
+fi
+
+if [ "$small_loss" != "unknown" ] && num_gt "$small_loss" "0"; then
+  issue "MAJOR" "ICMP packet loss detected on small ping." "loss=${small_loss}% avg_rtt=${small_avg}ms"
+fi
+
+if [ "$large_loss" != "unknown" ] && num_gt "$large_loss" "0"; then
+  issue "MAJOR" "ICMP packet loss detected on large ping." "loss=${large_loss}% payload=${PING_SIZE}; suspect MTU/fragmentation/congestion if small ping is clean."
+fi
+
+if [ "$small_loss" != "unknown" ] && [ "$large_loss" != "unknown" ]; then
+  if num_ge "$small_loss" "0" && num_gt "$large_loss" "$small_loss"; then
+    issue "MAJOR" "Large packets fail more than small packets." "small_loss=${small_loss}% large_loss=${large_loss}%: investigate MTU, fragmentation, VPN, firewall inspection."
+  fi
+fi
+
+if [ "$small_avg" != "unknown" ] && num_gt "$small_avg" "100"; then
+  issue "INFO" "High average latency on small ping." "avg_rtt=${small_avg}ms"
+fi
+
+if [ "$tr_timeouts" != "0" ]; then
+  issue "INFO" "Traceroute shows silent hops/timeouts." "timeouts=$tr_timeouts. Some routers/firewalls drop traceroute by policy; correlate with FTP/ping."
+fi
+
+if [ -s "$PCAP_ANALYSIS" ]; then
+  retrans="$(awk -F= '/^retransmissions=/ { print $2 }' "$PCAP_ANALYSIS" | tail -1)"
+  lostseg="$(awk -F= '/^lost_segments=/ { print $2 }' "$PCAP_ANALYSIS" | tail -1)"
+  dupack="$(awk -F= '/^duplicate_acks=/ { print $2 }' "$PCAP_ANALYSIS" | tail -1)"
+  [ -n "$retrans" ] || retrans="unknown"
+  [ -n "$lostseg" ] || lostseg="unknown"
+  [ -n "$dupack" ] || dupack="unknown"
+  if [ "$retrans" != "unknown" ] && num_gt "$retrans" "0"; then
+    issue "MAJOR" "TCP retransmissions found in PCAP." "retransmissions=$retrans duplicate_acks=$dupack lost_segments=$lostseg"
+  fi
+fi
+
+if grep -Eiq 'File transfer completed successfully|Transfer complete|226 ' "$FTPOUT" && [ ! -s "$ftp_errors_file" ]; then
+  ftp_result="OK"
+else
+  ftp_result="CHECK_LOG"
+fi
+
+if [ ! -s "$ISSUES" ]; then
+  issue "OK" "No obvious network or FTP problem detected by automated checks." "Review PCAP/report for confirmation."
+fi
+
+{
+  echo "NETSAVF PROBE REPORT"
+  echo "===================="
+  echo
+  echo "Version: $VERSION"
+  echo "Run id: $RUN_ID"
+  echo "Date: $(date)"
+  echo "IBM i source SAVF: $SAVF_LIB/$SAVF_NAME"
+  echo "Local stream copy size: ${LOCAL_BYTES} bytes (${LOCAL_MIB} MiB)"
+  echo "Remote FTP target: $HOST:$PORT"
+  echo "Remote path: $REMOTE_DIR/$REMOTE_FILE"
+  echo
+  echo "Executive summary"
+  echo "-----------------"
+  echo "FTP result: $ftp_result"
+  echo "FTP command status: $ftp_status"
+  echo "FTP transfer line: ${transfer_line:-not found}"
+  echo "FTP parsed bytes: $ftp_bytes"
+  echo "FTP parsed seconds: $ftp_secs"
+  echo "FTP parsed rate: $ftp_rate"
+  echo "FTP parsed throughput: $ftp_mbps Mbit/s"
+  echo "FTP wall time: $wall_secs seconds"
+  echo "Ping small loss/avg: ${small_loss}% / ${small_avg} ms"
+  echo "Ping large loss/avg: ${large_loss}% / ${large_avg} ms"
+  echo "Traceroute hops/timeouts: $tr_hops / $tr_timeouts"
+  echo
+  echo "Detected findings"
+  echo "-----------------"
+  cat "$ISSUES"
+  echo
+  echo "Artifacts"
+  echo "---------"
+  echo "Report: $REPORT"
+  echo "FTP output log, password redacted: $FTPOUT"
+  echo "FTP input, password redacted: $FTPIN_SAFE"
+  echo "CL command log: $CLLOG"
+  echo "Ping small: $PING_SMALL"
+  echo "Ping large: $PING_LARGE"
+  echo "Traceroute: $TRACEROUTE_OUT"
+  echo "Netstat routes: $NETSTAT_ROUTES"
+  echo "Netstat connection monitor: $NETSTAT_CONNS"
+  echo "TRCCNN PCAP: $PCAP"
+  echo "PCAP automatic analysis: $PCAP_ANALYSIS"
+  echo
+  echo "Interpretation guide"
+  echo "--------------------"
+  echo "- FTP 530/auth errors: account, password, disabled user, or remote FTP policy."
+  echo "- FTP 550/path errors: remote directory/file authority or wrong path."
+  echo "- FTP 425/426/data-channel errors: common with FTP through firewalls/NAT."
+  echo "- Connection refused: remote listener down or firewall actively rejects port $PORT."
+  echo "- Timeout/no route/unreachable: routing, firewall drop, remote host down, or ACL."
+  echo "- Small ping OK but large ping bad: suspect MTU, fragmentation, VPN, or inspection."
+  echo "- Traceroute timeouts alone are not proof of loss; many routers drop probes."
+  echo "- PCAP is the strongest local evidence. Open it in Wireshark and filter:"
+  echo "  tcp.analysis.retransmission || tcp.analysis.lost_segment || tcp.analysis.duplicate_ack"
+  echo
+  echo "Limits"
+  echo "------"
+  echo "- This tool sees the IBM i side only. To prove where packets are lost, capture"
+  echo "  at the remote host/firewall too and compare timestamps."
+  echo "- FTP is not encrypted. Do not use real production secrets across untrusted links."
+} > "$REPORT"
+
+if [ "$KEEP_IFS_COPY" != "1" ]; then
+  rm -f "$LOCAL_COPY"
+else
+  info_summary "Temporary SAVF copy kept: $LOCAL_COPY"
+fi
+
+rm -f "$ftp_errors_file"
+
+echo
+echo "Done."
+echo "Report: $REPORT"
+echo "Artifacts directory: $WORK"
